@@ -274,14 +274,7 @@ fn input(
                 .len();
         let brick_shape =
             &BRICK_TYPE_ARRAY[brick_state.brick_type_index].brick_shape_arr[brick_shape_idx_new];
-        println!(
-            "brick shape: {:?}, idx: {:?}, idx_new: {:?}, brick_origin_pos: {:?}",
-            brick_shape,
-            brick_state.brick_shape_index,
-            brick_shape_idx_new,
-            brick_state.brick_pos_origin,
-        );
-        brick_state.brick_shape_index = brick_shape_idx_new;
+
         let brick_pos_new_arr = brick_shape
             .brick_pos_arr
             .iter()
@@ -291,6 +284,7 @@ fn input(
             return;
         }
 
+        brick_state.brick_shape_index = brick_shape_idx_new;
         event_writer_move.send(ShiftEvent(brick_pos_new_arr.try_into().unwrap()));
         return;
     }
