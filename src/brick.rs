@@ -1,6 +1,6 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
-use bevy::prelude::*;
+use bevy::{prelude::*, utils::HashMap};
 use lazy_static::*;
 use rand::Rng;
 
@@ -12,6 +12,7 @@ impl Plugin for BrickPlugin {
             .add_event::<SpawnEvent>()
             .add_event::<StableEvent>()
             .add_event::<ShiftEvent>()
+            .add_event::<FullLineCheckEvent>()
             .add_systems(Startup, setup_board)
             .add_systems(Startup, setup_spawn)
             .add_systems(Startup, setup_fall_timer)
@@ -19,7 +20,8 @@ impl Plugin for BrickPlugin {
             .add_systems(Update, brick_auto_fall)
             .add_systems(Update, brick_shift)
             .add_systems(Update, brick_stable)
-            .add_systems(Update, brick_gen);
+            .add_systems(Update, brick_gen)
+            .add_systems(Update, brick_fullline_clear);
     }
 }
 
@@ -37,7 +39,7 @@ const START_Y: i8 = -BOARD_HEIGHT / 2;
 const SPAWN_X: i8 = BOARD_WIDTH / 2 - 2;
 const SPAWN_Y: i8 = BOARD_HEIGHT - 2;
 
-#[derive(Debug, Default, Component, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Component, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BrickPos {
     pub x: i8,
     pub y: i8,
@@ -133,6 +135,8 @@ pub struct SpawnEvent;
 pub struct StableEvent;
 #[derive(Event)]
 pub struct ShiftEvent([BrickPos; 4]);
+#[derive(Event)]
+pub struct FullLineCheckEvent;
 
 #[derive(Debug, Resource, Default)]
 pub struct FallTimer(Timer);
@@ -400,6 +404,7 @@ fn brick_stable(
     query: Query<Entity, With<BrickMoveable>>,
     mut stable_event_reader: EventReader<StableEvent>,
     mut spawn_event_writer: EventWriter<SpawnEvent>,
+    mut full_line_check_event_writer: EventWriter<FullLineCheckEvent>,
 ) {
     if stable_event_reader.is_empty() {
         return;
@@ -411,6 +416,82 @@ fn brick_stable(
     }
 
     spawn_event_writer.send(SpawnEvent);
+    full_line_check_event_writer.send(FullLineCheckEvent);
+}
+
+fn brick_fullline_clear(
+    mut commands: Commands,
+    mut query_brick_stable: Query<(Entity, &mut Transform, &mut BrickPos), Without<BrickMoveable>>,
+    mut full_line_check_event_reader: EventReader<FullLineCheckEvent>,
+) {
+    if full_line_check_event_reader.is_empty() || query_brick_stable.is_empty() {
+        return;
+    }
+    let brick_stable_arr = query_brick_stable
+        .iter()
+        .map(|(_, _, pos)| pos)
+        .collect::<Vec<&BrickPos>>();
+
+    full_line_check_event_reader.clear();
+
+    // get all y to remove
+    let mut y_to_remove = vec![];
+    for y in 0..BOARD_HEIGHT {
+        let mut is_full_line = true;
+        for x in 0..BOARD_WIDTH {
+            let brick_pos_tmp = BrickPos::new(x, y);
+            if !brick_stable_arr.contains(&&brick_pos_tmp) {
+                is_full_line = false;
+                break;
+            }
+        }
+
+        if is_full_line {
+            y_to_remove.push(y);
+        }
+    }
+
+    // remove all y line
+    for (entity, _, brick_pos) in query_brick_stable.iter() {
+        if y_to_remove.contains(&brick_pos.y) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // get all new brick_pos for left brick_pos
+    let mut left_brick_pos_new_pos_map = HashMap::new();
+    let mut target_y = 0_i8;
+    for y in 0..BOARD_HEIGHT {
+        if y_to_remove.contains(&y) {
+            continue;
+        }
+        let mut pos_assigned = false; // if new pos assigned in this target_y, target_y ++
+        for x in 0..BOARD_WIDTH {
+            let brick_pos_tmp = BrickPos::new(x, y);
+            if brick_stable_arr.contains(&&brick_pos_tmp) {
+                let brick_pos_new = BrickPos::new(x, target_y);
+                left_brick_pos_new_pos_map.insert(brick_pos_tmp, brick_pos_new);
+                pos_assigned = true;
+            }
+        }
+        if pos_assigned {
+            target_y += 1;
+        }
+    }
+
+    // move left brick pos to new pos
+    for (_, mut transform, mut brick_pos) in query_brick_stable.iter_mut() {
+        let brick_pos = brick_pos.as_mut();
+        if left_brick_pos_new_pos_map.contains_key(brick_pos) {
+            brick_pos.x = left_brick_pos_new_pos_map[brick_pos].x;
+            brick_pos.y = left_brick_pos_new_pos_map[brick_pos].y;
+
+            let xy = get_brick_pos_xy(brick_pos.x, brick_pos.y);
+
+            transform.translation.x = xy.0 as f32;
+            transform.translation.y = xy.1 as f32;
+        }
+    }
 }
 
 fn is_legal(brick_pos_arr_new: &Vec<BrickPos>, brick_stable_arr: &Vec<&BrickPos>) -> bool {
