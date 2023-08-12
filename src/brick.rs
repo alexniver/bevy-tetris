@@ -4,6 +4,8 @@ use bevy::{prelude::*, utils::HashMap};
 use lazy_static::*;
 use rand::Rng;
 
+use crate::app_state::AppState;
+
 pub struct BrickPlugin;
 
 impl Plugin for BrickPlugin {
@@ -11,17 +13,28 @@ impl Plugin for BrickPlugin {
         app.init_resource::<BrickState>()
             .add_event::<SpawnEvent>()
             .add_event::<StableEvent>()
-            .add_event::<ShiftEvent>()
+            .add_event::<NewPosEvent>()
             .add_event::<FullLineCheckEvent>()
-            .add_systems(Startup, setup_board)
-            .add_systems(Startup, setup_spawn)
-            .add_systems(Startup, setup_fall_timer)
-            .add_systems(Update, input)
-            .add_systems(Update, brick_auto_fall)
-            .add_systems(Update, brick_shift)
-            .add_systems(Update, brick_stable)
-            .add_systems(Update, brick_gen)
-            .add_systems(Update, brick_fullline_clear);
+            .add_event::<FullLineRemoveEvent>()
+            .add_event::<GameOverEvent>()
+            .add_event::<RestartEvent>()
+            .add_systems(Startup, (setup_board, setup_spawn, setup_fall_timer))
+            .add_systems(
+                Update,
+                (
+                    brick_gen,
+                    brick_auto_fall,
+                    input.after(brick_auto_fall),
+                    brick_apply_new_pos.after(input),
+                    brick_stable.after(brick_apply_new_pos),
+                )
+                    .run_if(in_state(AppState::Gaming)),
+            )
+            .add_systems(Update, restart.run_if(in_state(AppState::GameOver)))
+            .add_systems(
+                PostUpdate,
+                brick_fullline_clear.run_if(in_state(AppState::Gaming)),
+            );
     }
 }
 
@@ -134,9 +147,15 @@ pub struct SpawnEvent;
 #[derive(Event)]
 pub struct StableEvent;
 #[derive(Event)]
-pub struct ShiftEvent([BrickPos; 4]);
+pub struct NewPosEvent([BrickPos; 4]);
 #[derive(Event)]
 pub struct FullLineCheckEvent;
+#[derive(Event)]
+pub struct FullLineRemoveEvent(pub u8);
+#[derive(Event)]
+pub struct GameOverEvent;
+#[derive(Event)]
+pub struct RestartEvent;
 
 #[derive(Debug, Resource, Default)]
 pub struct FallTimer(Timer);
@@ -212,9 +231,28 @@ fn get_brick_pos_xy(x: i8, y: i8) -> (i32, i32) {
     )
 }
 
+fn restart(
+    mut commands: Commands,
+    query_brick: Query<Entity, With<BrickPos>>,
+    mut state: ResMut<NextState<AppState>>,
+    mut event_writer_spawn: EventWriter<SpawnEvent>,
+    keys: Res<Input<KeyCode>>,
+) {
+    if keys.just_pressed(KeyCode::R) {
+        for entity in query_brick.iter() {
+            commands.entity(entity).despawn();
+        }
+
+        state.set(AppState::Gaming);
+        event_writer_spawn.send(SpawnEvent);
+    }
+}
+
 fn brick_gen(
     mut commands: Commands,
+    query_brick_stable: Query<&BrickPos, Without<BrickMoveable>>,
     mut brick_state: ResMut<BrickState>,
+    mut game_state: ResMut<NextState<AppState>>,
     mut event_reader: EventReader<SpawnEvent>,
 ) {
     if event_reader.is_empty() {
@@ -232,8 +270,22 @@ fn brick_gen(
     brick_state.brick_shape_index = brick_shape_idx;
     brick_state.brick_pos_origin = BrickPos::new(SPAWN_X, SPAWN_Y);
 
-    for brick_pos in brick_shape.brick_pos_arr.iter() {
-        let brick_pos_spawn = BrickPos::new(SPAWN_X + brick_pos.x, SPAWN_Y + brick_pos.y);
+    let brick_pos_stable_arr = query_brick_stable.iter().collect::<Vec<&BrickPos>>();
+
+    let brick_pos_spawn_arr = brick_shape
+        .brick_pos_arr
+        .iter()
+        .map(|pos| BrickPos::new(SPAWN_X + pos.x, SPAWN_Y + pos.y))
+        .collect::<Vec<BrickPos>>();
+
+    let mut is_game_over = false;
+    for brick_pos_spawn in brick_pos_spawn_arr.iter() {
+        if brick_pos_stable_arr.contains(&brick_pos_spawn) {
+            is_game_over = true;
+        }
+    }
+
+    for brick_pos_spawn in brick_pos_spawn_arr {
         commands.spawn((
             SpriteBundle {
                 sprite: Sprite {
@@ -248,6 +300,10 @@ fn brick_gen(
             BrickMoveable,
         ));
     }
+
+    if is_game_over {
+        game_state.set(AppState::GameOver);
+    }
 }
 
 fn input(
@@ -256,7 +312,7 @@ fn input(
     keys: Res<Input<KeyCode>>,
     mut brick_state: ResMut<BrickState>,
     mut event_writer_stable: EventWriter<StableEvent>,
-    mut event_writer_move: EventWriter<ShiftEvent>,
+    mut event_writer_move: EventWriter<NewPosEvent>,
 ) {
     if query_brick_movable.is_empty() {
         return;
@@ -285,7 +341,7 @@ fn input(
         }
 
         brick_state.brick_shape_index = brick_shape_idx_new;
-        event_writer_move.send(ShiftEvent(brick_pos_new_arr.try_into().unwrap()));
+        event_writer_move.send(NewPosEvent(brick_pos_new_arr.try_into().unwrap()));
         return;
     }
 
@@ -330,7 +386,7 @@ fn input(
 
     brick_state.brick_pos_origin += brick_pos_move;
 
-    event_writer_move.send(ShiftEvent(brick_pos_new_arr.try_into().unwrap()));
+    event_writer_move.send(NewPosEvent(brick_pos_new_arr.try_into().unwrap()));
 }
 
 fn brick_auto_fall(
@@ -340,7 +396,7 @@ fn brick_auto_fall(
     time: Res<Time>,
     mut brick_state: ResMut<BrickState>,
     mut event_writer_stable: EventWriter<StableEvent>,
-    mut event_writer_shift: EventWriter<ShiftEvent>,
+    mut event_writer_new_pos: EventWriter<NewPosEvent>,
 ) {
     fall_timer.0.tick(time.delta());
 
@@ -366,13 +422,13 @@ fn brick_auto_fall(
 
         brick_state.brick_pos_origin += brick_pos_move;
 
-        event_writer_shift.send(ShiftEvent(brick_pos_new_arr.try_into().unwrap()));
+        event_writer_new_pos.send(NewPosEvent(brick_pos_new_arr.try_into().unwrap()));
     }
 }
 
-fn brick_shift(
+fn brick_apply_new_pos(
     mut query_brick_movable: Query<(&mut Transform, &mut BrickPos), With<BrickMoveable>>,
-    mut shift_event: EventReader<ShiftEvent>,
+    mut shift_event: EventReader<NewPosEvent>,
 ) {
     if query_brick_movable.is_empty() || shift_event.is_empty() {
         return;
@@ -395,7 +451,7 @@ fn brick_shift(
 
 fn brick_stable(
     mut commands: Commands,
-    query: Query<Entity, With<BrickMoveable>>,
+    query_movable: Query<Entity, With<BrickMoveable>>,
     mut stable_event_reader: EventReader<StableEvent>,
     mut spawn_event_writer: EventWriter<SpawnEvent>,
     mut full_line_check_event_writer: EventWriter<FullLineCheckEvent>,
@@ -405,7 +461,7 @@ fn brick_stable(
     }
     stable_event_reader.clear();
 
-    for entity in query.iter() {
+    for entity in query_movable.iter() {
         commands.entity(entity).remove::<BrickMoveable>();
     }
 
@@ -417,16 +473,17 @@ fn brick_fullline_clear(
     mut commands: Commands,
     mut query_brick_stable: Query<(Entity, &mut Transform, &mut BrickPos), Without<BrickMoveable>>,
     mut full_line_check_event_reader: EventReader<FullLineCheckEvent>,
+    mut full_line_remove_event_writer: EventWriter<FullLineRemoveEvent>,
 ) {
     if full_line_check_event_reader.is_empty() || query_brick_stable.is_empty() {
         return;
     }
+    full_line_check_event_reader.clear();
+
     let brick_stable_arr = query_brick_stable
         .iter()
         .map(|(_, _, pos)| pos)
         .collect::<Vec<&BrickPos>>();
-
-    full_line_check_event_reader.clear();
 
     // get all y to remove
     let mut y_to_remove = vec![];
@@ -445,6 +502,10 @@ fn brick_fullline_clear(
         }
     }
 
+    if y_to_remove.len() == 0 {
+        return;
+    }
+
     // remove all y line
     for (entity, _, brick_pos) in query_brick_stable.iter() {
         if y_to_remove.contains(&brick_pos.y) {
@@ -459,6 +520,7 @@ fn brick_fullline_clear(
         if y_to_remove.contains(&y) {
             continue;
         }
+
         let mut pos_assigned = false; // if new pos assigned in this target_y, target_y ++
         for x in 0..BOARD_WIDTH {
             let brick_pos_tmp = BrickPos::new(x, y);
@@ -468,6 +530,7 @@ fn brick_fullline_clear(
                 pos_assigned = true;
             }
         }
+
         if pos_assigned {
             target_y += 1;
         }
@@ -486,6 +549,8 @@ fn brick_fullline_clear(
             transform.translation.y = xy.1 as f32;
         }
     }
+
+    full_line_remove_event_writer.send(FullLineRemoveEvent(y_to_remove.len() as u8));
 }
 
 fn is_legal(brick_pos_arr_new: &Vec<BrickPos>, brick_stable_arr: &Vec<&BrickPos>) -> bool {
